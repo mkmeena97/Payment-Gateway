@@ -30,16 +30,27 @@ router.post('/verify/:paymentIntentId', auth, async (req, res) => {
 
 // Transfer funds
 router.post('/transfer', auth, async (req, res) => {
-  try {
-    const transfer = await paymentService.transferFunds({
-      amount: req.body.amount,
-      currency: req.body.currency,
-      destinationAccount: req.body.destinationAccount
-    });
-    res.json(transfer);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
+    try {
+      const transfer = await paymentService.transferFunds({
+        senderId: req.user.id,  
+        receiverId: req.body.receiverId, 
+        amount: req.body.amount,
+        currency: req.body.currency
+      });
+      res.json(transfer);
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  });
+
+  // Get payment history
+router.get('/history', auth, async (req, res) => {
+    try {
+      const history = await paymentService.getPaymentHistory(req.user.id);
+      res.json(history);
+    } catch (error) {
+      res.status(400).json({ error: error.message });
+    }
+  });
 
 export default router;

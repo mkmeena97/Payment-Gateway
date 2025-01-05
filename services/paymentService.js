@@ -1,82 +1,87 @@
-import Stripe from 'stripe';
 import Payment from '../models/payment.js';
 import Transaction from '../models/transaction.js';
 import User from '../models/user.js';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
 class PaymentService {
-  // Initialize payment and create payment intent
+  // Initialize payment
   async createPayment(paymentData) {
     try {
-      // Create payment intent with Stripe
-      const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(paymentData.amount * 100), // Convert to cents
-        currency: paymentData.currency.toLowerCase(),
-        payment_method_types: ['card'],
-        metadata: {
-          userId: paymentData.userId.toString()
-        }
-      });
+      // Check if user has existing transactions
+      const existingTransaction = await Transaction.findOne({ 
+        $or: [
+          { senderId: paymentData.userId }, 
+          { receiverId: paymentData.userId }
+        ] 
+      }).sort({ createdAt: -1 });
 
-      // Create payment record in our database
+      // If user has transactions, enforce same currency
+      if (existingTransaction && existingTransaction.currency !== paymentData.currency) {
+        throw new Error(`Currency mismatch. Your wallet is in ${existingTransaction.currency}. Please use the same currency.`);
+      }
+
+      // Create payment record
       const payment = new Payment({
         amount: paymentData.amount,
-        currency: paymentData.currency,
-        paymentMethod: 'card',
+        currency: paymentData.currency.toUpperCase(), 
         userId: paymentData.userId,
-        transactionId: paymentIntent.id
+        transactionId: Date.now().toString()
       });
 
       await payment.save();
 
       return {
         paymentId: payment._id,
-        clientSecret: paymentIntent.client_secret,
         amount: paymentData.amount,
-        currency: paymentData.currency
+        currency: payment.currency,
+        status: 'pending'
       };
     } catch (error) {
       throw new Error('Payment creation failed: ' + error.message);
     }
   }
 
-  // Verify payment status
-  async verifyPayment(paymentIntentId) {
+  // Verify payment (simplified)
+  async verifyPayment(paymentId) {
     try {
-      const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
-      const payment = await Payment.findOne({ transactionId: paymentIntentId });
+      const payment = await Payment.findById(paymentId);
 
       if (!payment) {
         throw new Error('Payment not found');
       }
 
-      if (paymentIntent.status === 'succeeded') {
-        payment.status = 'completed';
-        await payment.save();
+      // Update payment status
+      payment.status = 'completed';
+      await payment.save();
 
-        // Create transaction record
-        const transaction = new Transaction({
-          paymentId: payment._id,
-          senderId: payment.userId,
-          receiverId: payment.userId, // In case of adding funds, sender = receiver
-          amount: payment.amount,
-          currency: payment.currency,
-          type: 'payment',
-          status: 'completed'
-        });
+      // Create transaction record for adding funds to wallet
+      const transaction = new Transaction({
+        paymentId: payment._id,
+        senderId: payment.userId,
+        receiverId: payment.userId, 
+        amount: payment.amount,
+        currency: payment.currency,
+        type: 'payment', 
+        status: 'completed',
+        description: 'Added funds to wallet' 
+      });
 
-        await transaction.save();
+      await transaction.save();
 
-        // Update user balance
-        const user = await User.findById(payment.userId);
-        user.balance += payment.amount;
-        await user.save();
-
-        return { success: true, payment, transaction };
+      // Update user balance
+      const user = await User.findById(payment.userId);
+      if (!user) {
+        throw new Error('User not found');
       }
 
-      return { success: false, message: 'Payment not completed' };
+      user.balance = (user.balance || 0) + payment.amount;
+      await user.save();
+
+      return { 
+        success: true, 
+        payment,
+        transaction,
+        currentBalance: user.balance
+      };
     } catch (error) {
       throw new Error('Payment verification failed: ' + error.message);
     }
@@ -89,8 +94,21 @@ class PaymentService {
 
       // Check sender's balance
       const sender = await User.findById(senderId);
+      if (!sender) {
+        throw new Error('Sender not found');
+      }
+
+      // Validate currency matches sender's last transaction
+      const lastTransaction = await Transaction.findOne({ 
+        $or: [{ senderId }, { receiverId: senderId }] 
+      }).sort({ createdAt: -1 });
+
+      if (lastTransaction && lastTransaction.currency !== currency) {
+        throw new Error(`Currency mismatch. Your wallet is in ${lastTransaction.currency}. Please use the same currency.`);
+      }
+
       if (sender.balance < amount) {
-        throw new Error('Insufficient funds');
+        throw new Error(`Insufficient funds. Your balance is ${sender.balance} ${lastTransaction?.currency || currency}`);
       }
 
       const receiver = await User.findById(receiverId);
@@ -98,80 +116,49 @@ class PaymentService {
         throw new Error('Receiver not found');
       }
 
+      // Create a payment record for the transfer
+      const payment = new Payment({
+        amount,
+        currency: lastTransaction?.currency || currency, 
+        paymentMethod: 'transfer',
+        userId: senderId,
+        status: 'completed',
+        transactionId: Date.now().toString()
+      });
+
       // Create transaction record
       const transaction = new Transaction({
+        paymentId: payment._id,
         senderId,
         receiverId,
         amount,
-        currency,
+        currency: lastTransaction?.currency || currency, 
         type: 'transfer',
-        status: 'completed'
+        status: 'completed',
+        description: `Transfer to ${receiver.firstName} ${receiver.lastName}`
       });
 
       // Update balances
       sender.balance -= amount;
-      receiver.balance += amount;
+      receiver.balance = (receiver.balance || 0) + amount;
 
-      // Save all changes in a transaction
+      // Save all changes
       await Promise.all([
+        payment.save(),
         transaction.save(),
         sender.save(),
         receiver.save()
       ]);
 
-      return { success: true, transaction };
+      return { 
+        success: true, 
+        transaction,
+        senderBalance: sender.balance,
+        receiverBalance: receiver.balance,
+        currency: lastTransaction?.currency || currency
+      };
     } catch (error) {
       throw new Error('Fund transfer failed: ' + error.message);
-    }
-  }
-
-  // Refund payment
-  async refundPayment(refundData) {
-    try {
-      const { paymentId, amount } = refundData;
-      const payment = await Payment.findById(paymentId);
-
-      if (!payment) {
-        throw new Error('Payment not found');
-      }
-
-      if (payment.status !== 'completed') {
-        throw new Error('Payment cannot be refunded');
-      }
-
-      // Create refund in Stripe
-      const refund = await stripe.refunds.create({
-        payment_intent: payment.transactionId,
-        amount: Math.round(amount * 100) // Convert to cents
-      });
-
-      // Create refund transaction
-      const transaction = new Transaction({
-        paymentId: payment._id,
-        senderId: payment.userId,
-        receiverId: payment.userId,
-        amount: amount,
-        currency: payment.currency,
-        type: 'refund',
-        status: 'completed'
-      });
-
-      // Update payment status
-      payment.status = 'refunded';
-
-      // Update user balance
-      const user = await User.findById(payment.userId);
-      user.balance -= amount;
-
-      await Promise.all([
-        transaction.save(),
-        payment.save(),
-        user.save()
-      ]);
-
-      return { success: true, refund, transaction };
-    } catch (error) {
-      throw new Error('Refund failed: ' + error.message);
     }
   }
 
@@ -199,12 +186,7 @@ class PaymentService {
         throw new Error('Payment not found');
       }
 
-      const stripePayment = await stripe.paymentIntents.retrieve(payment.transactionId);
-
-      return {
-        ...payment.toObject(),
-        stripeDetails: stripePayment
-      };
+      return payment;
     } catch (error) {
       throw new Error('Failed to fetch payment details: ' + error.message);
     }
